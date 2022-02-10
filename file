@@ -1,0 +1,964 @@
+#!/bin/sh                                                                            
+# Ubiquiti appliance system tools                -*- shell-script -*-                
+# Copyright (c) 2012-2015 Ubiquiti Networks, Inc. http://www.ubnt.com                
+# vim: ft=sh                                                                         
+                                                                                     
+PATH=/bin:/sbin:/usr/bin:/usr/sbin                                                   
+                                                                                     
+IS_UDM=false                                                                         
+if grep -qsi udm /sys/firmware/devicetree/base/soc/board-cfg/id; then                
+        IS_UDM=true                                                                  
+        DATA_DIR=/mnt/data                                                           
+        UOS_DATA=${DATA_DIR}/unifi-os                                                
+        PERSISTENT_DIR=${DATA_DIR}/system                                            
+        SSHD_STATUS="${PERSISTENT_DIR}/sshd_status"                                  
+        UCORE_FIRMWARE_DIR="${UOS_DATA}/unifi-core/firmware"                         
+        UCORE_URL="http://127.0.0.1:11081"                                           
+fi                                                                                   
+                                                                                     
+usage() {                                                                            
+        echo "Ubiquiti system tools, v1.0"                                           
+        echo "Usage: $0 <command> [<arguments>]"                                     
+        echo "  supported commands:"                                                 
+        echo "     adminemail <newemail>"                                            
+        echo "     adminname <newname>"                                              
+        echo "     chpasswd"                                                         
+        echo "     cleanup"                                                          
+$IS_UDM &&                                                                           
+        echo "     cputemp"                                                          
+        echo "     filterpii <path>"                                                 
+        echo "     fwupdatestatus"                                                   
+        echo "     fwupdate <updatefile>"                                            
+        echo "     hostname <newhostname>"                                           
+        echo "     led  <ledname> <action> <action-arg1> <action-arg2> <action-arg3>"
+        echo "     network  <networkinterfacefile>"                   
+$IS_UDM &&                                                            
+        echo "     portstatus"                                        
+        echo "     poweroff"                                          
+        echo "     pwcheck"                                           
+        echo "     reboot"                                            
+        echo "     reset2defaults"                                    
+        echo "     resetbutton <true|false>"                          
+        echo "     sshd <true|false>"                                 
+$IS_UDM &&                                                            
+        echo "     support <path>"                                    
+$IS_UDM &&                                                            
+        echo "     anonid"                                                            
+        echo "     synctime"                                                          
+        echo "     timezone <newtimezone>"                                            
+        echo "     cpuload"                                                                            
+                                                                                                       
+        exit 1                                                                                         
+}  
+
+# prints error message and exits the process with the given error code               
+# args: <exit code> <message>                                                        
+err() {                                                                              
+        local rc msg                                                                 
+        rc=$1                                                                        
+        shift                                                                        
+        msg=$*                                                                       
+        printf "ERROR: ${msg}\n"                                                     
+        exit ${rc}                                                                   
+}                                                                                    
+                                                                                     
+copy_file() {                                                                        
+        if [ -f "$1" ]; then                                                         
+                cp -f $1 $2                                                          
+        else                                                                         
+                return 1                                                             
+        fi                                                                           
+}                                                                                    
+                                                                                     
+unlock_and_err() {                                                    
+        local lockfile                                                
+        lockfile=$1                                                   
+        dotlockfile -u ${lockfile}                                    
+        shift                                                         
+        err $*                                                        
+}                                                                     
+                                                                      
+save_user_pass_tz_hostname() {                                        
+        if [ -d ${DATA_DIR} ]; then                                   
+                mkdir -p ${PERSISTENT_DIR}                            
+                cp /etc/passwd ${PERSISTENT_DIR}/                     
+                cp /etc/shadow ${PERSISTENT_DIR}/                                     
+                cp /etc/security/usermap.conf ${PERSISTENT_DIR}/                      
+                cp /etc/timezone ${PERSISTENT_DIR}/                                   
+                cp /etc/hostname ${PERSISTENT_DIR}/                                                    
+                                                                                                       
+                sync                                                                                   
+        fi                                                                                             
+}  
+
+  change_adminemail() {                                                                
+        change_admin email "$@"                                                      
+}                                                                                    
+                                                                                     
+change_adminname() {                                                                 
+        change_admin name "$@"                                                       
+}                                                                                    
+                                                                                     
+change_admin() {                                                                     
+        local LOCKFILE field                                                         
+        local newadmin newadminuid                                                   
+        local oldadmin oldadminuid                                                   
+        local invalidformat rc                                                       
+        local usermaptmpf shadowtmpf passwdtmpf                                      
+        LOCKFILE="/run/lock/chadmin"                                                 
+        field=$1                                                                     
+        newadmin=$2                                                                  
+                                                                                     
+        if [ "${field}" != "name" -a "${field}" != "email" ]; then                   
+                return 0                                                             
+        fi                                                                           
+                                                                                     
+        if [ ${#newadmin} -gt 32 ]; then                                             
+                err 1 "${newadmin} is too long (max len:32) !"                       
+        fi                                                                           
+                                                                                     
+        invalidformat=1                                                              
+        if [ "${field}" != "email" ]; then                                           
+                expr match "${newadmin}" "^[a-zA-Z0-9][-a-zA-Z0-9_]*$" >/dev/null 2>&1
+                invalidformat=$?                                                      
+        else                                                                          
+                expr match "${newadmin}" "^[a-zA-Z0-9][-a-zA-Z0-9_@.+%]*[-a-zA-Z0-9_]$" >/dev/null 2>&1
+                invalidformat=$?                                                                       
+        fi                                                                                             
+                                                                                                       
+        if [ "${newadmin}" = "" -o "${newadmin}" = "root" -o ${invalidformat} -ne 0 ]; then            
+                err 1 "invalid format: ${newadmin} !"                                                  
+        fi                                                                                             
+        mkdir -p /run/lock                                                                             
+                                                                                                       
+        dotlockfile -l -p -r 1 ${LOCKFILE}                                                             
+        rc=$?                                                                                          
+        if [ $rc -ne 0 ]; then                                                                         
+                err 1 "cannot aquire lock file (${LOCKFILE}) !"                                        
+        fi                                                                                             
+                                                                                                       
+        if [ "${field}" != "email" ]; then                                                             
+                oldadmin=$(awk -F: '/root/{if ($1 != "root") print $1}' /etc/security/usermap.conf | sed -n '1p')
+        else                                                                                                     
+                oldadmin=$(awk -F: '/root/{if ($1 != "root") print $1}' /etc/security/usermap.conf | sed -n '2p')
+        fi                                                                                                       
+                                                                                                                 
+        if [ "${oldadmin}" = "" ]; then                                                                          
+                dotlockfile -u ${LOCKFILE}                                                                       
+                return 0                                                                                         
+        fi                                                                                                       
+                                                                                                                 
+        if [ "${newadmin}" = "${oldadmin}" ]; then                                                               
+                dotlockfile -u ${LOCKFILE}                                                                       
+                err 1 "new admin (${newadmin}) is the same as old admin (${oldadmin}) !"                         
+        fi                                                                                                       
+                                                                                                                 
+        oldadminuid=$(id -u ${oldadmin} 2>/dev/null)                                                             
+        if [ "${oldadminuid}" != "" ]; then                                                                      
+                if [ ${oldadminuid} -gt 0 ]; then                                                                
+                        dotlockfile -u ${LOCKFILE}                                                               
+                        err 1 "current admin (${oldadmin}) exists with non-zero UID (${oldadminuid}) !"          
+                fi                                                                                               
+        fi                                                                                                       
+                                                                                                                 
+        newadminuid=$(id -u ${newadmin} 2>/dev/null)                                                             
+        if [ "${newadminuid}" != "" ]; then                                                                      
+                dotlockfile -u ${LOCKFILE}                                                                       
+                err 1 "new admin (${newadmin}) already exists with UID: ${newadminuid} !"                        
+        fi                                                                                                       
+                                                                                                                 
+        usermaptmpf=`mktemp usermap.XXXXXXXX`                                                                    
+        sed "s,^${oldadmin}:,${newadmin}:,g" /etc/security/usermap.conf > ${usermaptmpf}                         
+        rc=$?                                                                                                    
+        if [ $rc -ne 0 ]; then                                                                                   
+                [ ! -f ${usermaptmpf} ] || rm -f ${usermaptmpf}                                                  
+                dotlockfile -u ${LOCKFILE}                                                                       
+                err 1 "replace ${oldadmin} with ${newadmin} in /etc/security/usermap.conf failed!"               
+        fi                                                                                                       
+                                                                                                                 
+        if [ "${oldadminuid}" = "" ]; then                                                                       
+                # use useradd command to add newadmin if oldadmin doesn't exist in the system                    
+                useradd -o -d /root -g 0 -u 0 -s /bin/bash ${newadmin}                                           
+                rc=$?                                                                                            
+                if [ $rc -ne 0 ]; then                                                                           
+                        [ ! -f ${usermaptmpf} ] || rm -f ${usermaptmpf}                                          
+                        dotlockfile -u ${LOCKFILE}                                                               
+                        err 1 "replace ${oldadmin} with ${newadmin} in /etc/shadow failed!"                      
+                fi                                                                                               
+        else                                                                                                    
+                # replace oldadmin with newadmin in /etc/shadow and /etc/shadow                                  
+                shadowtmpf=`mktemp shadow.XXXXXXXX`                                                              
+                sed "s,^${oldadmin}:,${newadmin}:,g" /etc/shadow > ${shadowtmpf}                                 
+                rc=$?                                                                                            
+                if [ $rc -ne 0 ]; then                                                                           
+                        [ ! -f ${usermaptmpf} ] || rm -f ${usermaptmpf}                                          
+                        [ ! -f ${shadowtmpf} ] || rm -f ${shadowtmpf}                                            
+                        dotlockfile -u ${LOCKFILE}                                                               
+                        err 1 "replace ${oldadmin} with ${newadmin} in /etc/shadow failed!"                      
+                fi                                                                                               
+                                                                                                                 
+                passwdtmpf=`mktemp passwd.XXXXXXXX`                                                              
+                sed "s,^${oldadmin}:,${newadmin}:,g" /etc/passwd > ${passwdtmpf}                                 
+                rc=$?                                                                                            
+                if [ $rc -ne 0 ]; then                                                                           
+                        [ ! -f ${usermaptmpf} ] || rm -f ${usermaptmpf}                                          
+                        [ ! -f ${shadowtmpf} ] || rm -f ${shadowtmpf}                                            
+                        [ ! -f ${passwdtmpf} ] || rm -f ${passwdtmpf}                                            
+                        dotlockfile -u ${LOCKFILE}                                                               
+                        err 1 "replace ${oldadmin} with ${newadmin} in /etc/passwd failed!"                      
+                fi                                                                                               
+                mv ${shadowtmpf} /etc/shadow && chmod 640 /etc/shadow                                            
+                mv ${passwdtmpf} /etc/passwd && chmod 644 /etc/passwd                                            
+        fi                                                                                                       
+                                                                                                                 
+        mv ${usermaptmpf} /etc/security/usermap.conf && chmod 644 /etc/security/usermap.conf                     
+                                                                                                                 
+        save_user_pass_tz_hostname                                                                               
+                                                                                                                 
+        dotlockfile -u ${LOCKFILE}                                                                               
+        return 0                                                                                                 
+}                                                                                                                
+                                                                                                                 
+change_timezone() {                                                                                              
+        tzname=$1                                                                                                
+        tzfile="/usr/share/zoneinfo/$1"                                                                          
+        if [ -f $tzfile ]; then                                                                                  
+                if ! command -v timedatectl >/dev/null 2>&1 ||                                                   
+                   ! timedatectl set-timezone "${tzname}"; then                                                  
+                        ln -sf $tzfile /etc/localtime                                                            
+                        echo "$tzname" > /etc/timezone                                                           
+                        save_user_pass_tz_hostname                                                               
+                fi                                                                                               
+        else                                                                                                     
+                err 1 "Timezone $tzname does not exist."                                                         
+        fi                                                                                                       
+}
+
+change_hostname() {                                                                                              
+        echo "$1" > /etc/hostname                                                                                
+        echo "$1" > /proc/sys/kernel/hostname                                                                    
+        local HLINE="127.0.1.1  ${1}"                                                                            
+        if grep -q 127.0.1.1 /etc/hosts 2>/dev/null; then                                                        
+                sed -i "s/^127.0.1.1.*/${HLINE}/" /etc/hosts                                                     
+        else                                                                                                     
+                echo "$HLINE" >> /etc/hosts                                                                      
+        fi                                                                                                       
+        save_user_pass_tz_hostname                                                                               
+}                                                                                                                
+                                                                                                                 
+change_network_ifupdown() {                                                                                      
+        if [ -f "$1" ]; then                                                                                     
+                if diff -q $1 /etc/network/interfaces >/dev/null 2>&1; then                                      
+                        echo "no changes, skipping update"                                                       
+                else                                                                                             
+                        ifdown -a -X lo                                                                          
+                        copy_file $1 /etc/network/interfaces                                                     
+                        ifup -a                                                                                  
+                fi                                                                                               
+        else                                                                                                     
+                err 2 "File not found: $1"                                                                       
+        fi                                                                                                       
+}                                                                                                                
+                                                                                                                 
+# args: <systemd service> <new service file>                                                                     
+change_network_systemd() {                                                                                       
+        if [ ! -f "$2" ]; then                                                                                   
+                err 2 "File not found: $2"                                                                       
+        fi                                                                                                       
+                                                                                                                 
+        if diff -q $2 /etc/systemd/network/$1 >/dev/null 2>&1; then                                              
+                echo "no changes, skipping update"                                                               
+        else                                                                                                     
+                copy_file $2 /etc/systemd/network/$1                                                             
+                chmod 0644 /etc/systemd/network/$1                                                               
+                systemctl restart systemd-networkd                                                               
+        fi                                                                                                       
+}                                                                                                                
+                                                                                                                 
+change_network() {                                                                                               
+        # TODO: is /run/systemd/netif sufficient indicator?                                                      
+        if [ -d /run/systemd/netif ]; then                                                                       
+                change_network_systemd eth0.network $1                                                           
+        else                                                                                                     
+                change_network_ifupdown $1                                                                       
+        fi                                                                                                       
+}
+
+do_resetbutton() {                                                                                               
+        local CFGFILE=/etc/default/infctld                                                                       
+        local VAL=enabled                                                                                        
+        [ -f "${CFGFILE}" ] || (touch "${CFGFILE}"; chmod go+r "${CFGFILE}")                                     
+        . "${CFGFILE}"                                                                                           
+        # cleanup leading whitespace                                                                             
+        INFCTLD_ARGS=${INFCTLD_ARGS#"${INFCTLD_ARGS%%[![:space:]]*}"}                                            
+        # -n indicates that reset button is disabled                                                             
+        [ "${INFCTLD_ARGS#*-n}" != "${INFCTLD_ARGS}" ] && VAL=disabled                                           
+                                                                                                                 
+        if [ $# -eq 0 ]; then                                                                                    
+                echo $VAL                                                                                        
+        else                                                                                                     
+                local NEWVAL=enabled                                                                             
+                [ "$1" = "false" -o "$1" = "no" -o "$1" = "disable" ] && NEWVAL=disabled                         
+                                                                                                                 
+                [ "${NEWVAL}" = "${VAL}" ] && return                                                             
+                                                                                                                 
+                tmpfile=$(mktemp infctld.XXXXXXXX)                                                               
+                                                                                                                 
+                if [ "$NEWVAL" = "disabled" ]; then                                                              
+                        sed '/INFCTLD_ARGS/d' "${CFGFILE}" > ${tmpfile}                                          
+                        printf "INFCTLD_ARGS=\"${INFCTLD_ARGS} -n\"" >> ${tmpfile}                               
+                else                                                                                             
+                        sed '/INFCTLD_ARGS/ s/\-n//g' "${CFGFILE}" > ${tmpfile}                                  
+                fi                                                                                               
+                mv ${tmpfile} ${CFGFILE}                                                                         
+                service infctld restart                                                                          
+        fi                                                                                                       
+}                                                                                                                
+                                                                                                                 
+do_sshd() {                                                                                                      
+        local VAL=enabled                                                                                        
+        if $IS_UDM; then                                                                                         
+                [ -f "${SSHD_STATUS}" ] && VAL=$(cat "${SSHD_STATUS}")                                           
+        else                                                                                                     
+                systemctl -q is-enabled ssh || VAL=disabled                                                      
+        fi                                                                                                       
+        if [ $# -eq 0 ]; then                                                                                    
+                echo $VAL                                                                                        
+        else                                                                                                     
+                local NEWVAL=enabled                                                                             
+                [ "$1" = "false" -o "$1" = "no" -o "$1" = "disable" ] && NEWVAL=disabled                         
+                [ "${NEWVAL}" = "${VAL}" ] && return                                                             
+                if $IS_UDM; then                                                                                 
+                        mkdir -p $(dirname "${SSHD_STATUS}")                                                     
+                        echo $NEWVAL > "${SSHD_STATUS}"                                                          
+                        if [ "$NEWVAL" = "disabled" ]; then                                                      
+                                /etc/init.d/dropbear stop                                                        
+                        else                                                                                     
+                                /etc/init.d/dropbear start                                                       
+                        fi                                                                                       
+                        return                                                                                   
+                fi                                                                                               
+                if [ "$NEWVAL" = "disabled" ]; then                                                              
+                        systemctl disable ssh                                                                    
+                        systemctl --no-block stop ssh || true                                                    
+                else                                                                                             
+                        systemctl enable ssh                                                                     
+                        systemctl --no-block restart ssh                                                         
+                fi                                                                                               
+        fi                                                                                                       
+}                                                                                                                
+                                                                                                                 
+do_ssh() {                                                                                                       
+        do_sshd $@                                                                                               
+}                                                                                                                
+                                                                                                                 
+set_fwupdate_status() {                                                                                          
+        local statusfile status                                                                                  
+        statusfile=$1                                                                                            
+        shift                                                                                                    
+        status=$*                                                                                                
+        echo "${status}" > "/var/run/${statusfile}"                                                              
+        [ ! -d "${UCORE_FIRMWARE_DIR}" ] || echo "${status}" > "${UCORE_FIRMWARE_DIR}/${statusfile}"             
+}                                                                                                                
+                                                                                                                 
+fw_move() {                                                                                                      
+        local file rc                                                                                            
+        file=$1                                                                                                  
+                                                                                                                 
+        [ "/boot/fwupdate.bin" != "${file}" ] || return 0                                                        
+                                                                                                                 
+        if mountpoint -q /boot >/dev/null 2>&1; then                                                             
+                mount -o remount,rw /boot || true                                                                
+        fi                                                                                                       
+                                                                                                                 
+        mv -f "${file}" /boot/fwupdate.bin                                                                       
+        rc=$?                                                                                                    
+                                                                                                                 
+        if mountpoint -q /boot >/dev/null 2>&1; then                                                             
+                mount -o remount,ro /boot || true                                                                
+        fi                                                                                                       
+                                                                                                                 
+        return $rc                                                                                               
+}
+
+do_fwupdatestatus() {                                                                                            
+        local LOCKFILE PID STATUSFILE                                                                            
+        LOCKFILE="/var/run/fwupdate.pid"                                                                         
+        dotlockfile -l -p -r 0 ${LOCKFILE}                                                                       
+        rc=$?                                                                                                    
+        if [ $rc -ne 0 ]; then                                                                                   
+                PID=$(cat ${LOCKFILE})                                                                           
+                STATUSFILE="/var/run/fwupdate.status.${PID}"                                                     
+                [ ! -f ${STATUSFILE} ] || cat ${STATUSFILE}                                                      
+                return 0                                                                                         
+        fi                                                                                                       
+        dotlockfile -u ${LOCKFILE}                                                                               
+        echo "none"                                                                                              
+        return 1                                                                                                 
+}                                                                                                                
+                                                                                                                 
+do_fwupdate() {                                                                                                  
+        local file ver rc LOCKFILE                                                                               
+        local FWUPDATE=fwupdate                                                                                  
+        $IS_UDM && FWUPDATE=fwupdate.real                                                                        
+                                                                                                                 
+        if [ -z "${1}" ]; then                                                                                   
+                err 2 "No update file!"                                                                          
+        fi                                                                                                       
+                                                                                                                 
+        local keepfile=0                                                                                         
+        if [ "${2}" = "-k" ]; then                                                                               
+                keepfile=1                                                                                       
+        fi                                                                                                       
+                                                                                                                 
+        local LOCKFILE="/var/run/fwupdate.pid"                                                                   
+        dotlockfile -l -p -r 0 ${LOCKFILE}                                                                       
+        rc=$?                                                                                                    
+        if [ $rc -ne 0 ]; then                                                                                   
+                err 1 "cannot aquire lock file (${LOCKFILE}) !"                                                  
+        fi                                                                                                       
+                                                                                                                 
+        local PID=$$                                                                                             
+        local STATUSFILE="fwupdate.status.${PID}"                                                                
+        echo ${PID}                                                                                              
+        [ ! -d "${UCORE_FIRMWARE_DIR}" ] || echo "${PID}" > "${UCORE_FIRMWARE_DIR}/fwupdate.pid"                 
+                                                                                                                 
+        if [ -e "${1}" ]; then                                                                                   
+                file="${1}"                                                                                      
+        else                                                                                                    
+                local wget_cmd curl_cmd                                                                          
+                wget_cmd=$(command -v wget 2>/dev/null)                                                          
+                curl_cmd=$(command -v curl 2>/dev/null)                                                          
+                                                                                                                 
+                [ -n "${wget_cmd}" -o -n "${curl_cmd}" ] || unlock_and_err ${LOCKFILE} 6 "Cannot retrieve non-local firmware ${1} (missing wget/curl)!"
+                [ -n "${TMPDIR}" ] || TMPDIR=/var/tmp                                                                                                  
+                mkdir -p "${TMPDIR}" || unlock_and_err ${LOCKFILE} 6 "Cannot create directory ${TMPDIR}!"                                              
+                rm -f ${TMPDIR}/fwupdate.* >/dev/null 2>&1                                                                                             
+                file=$(mktemp -p "${TMPDIR}" fwupdate.XXXXXXXXXX)                                                                                      
+                rc=0                                                                                                                                   
+                set_fwupdate_status ${STATUSFILE} "downloading"                                                                                        
+                if [ -n "${wget_cmd}" ]; then                                                                                                          
+                        ${wget_cmd} -O "${file}" -t 5 "${1}"                                                                                           
+                        rc=$?                                                                                                                          
+                elif [ -n "${curl_cmd}" ]; then                                                                                                        
+                        ${curl_cmd} -o "${file}" "${1}"                                                                                                
+                        rc=$?                                                                                                                          
+                else                                                                                                                                   
+                        # should never get here..                                                                                                      
+                        rc=69                                                                                                                          
+                fi                                                                                                                                     
+                                                                                                                                                       
+                if [ $rc -ne 0 ]; then                                                                                                                 
+                        rm -f ${file}                                                                                                                  
+                        set_fwupdate_status ${STATUSFILE} "failed"                                                                                     
+                        unlock_and_err ${LOCKFILE} 3 "Failed downloading firmware from ${1}, rc: ${rc}"                                                
+                fi                                                                                                                                     
+        fi                                                                                                                                             
+                                                                                                                                                       
+        set_fwupdate_status ${STATUSFILE} "checking"                                                                                                   
+        if command -v fwinfo >/dev/null 2>&1; then                                                                                                     
+                ver=$(fwinfo ${file})                                                                                                                  
+                rc=$?                                                                                                                                  
+                if [ $rc -ne 0 ]; then                                                                                                                 
+                        set_fwupdate_status ${STATUSFILE} "invalid"                                                                                    
+                        [ ${keepfile} -eq 1 ] || rm -f ${file}                                                                                         
+                        unlock_and_err ${LOCKFILE} 9 "Invalid firmware file ${file}!\n"                                                                
+                fi                                                                                                                                     
+        fi                                                                                                                                             
+                                                                                                                                                       
+        if command -v $FWUPDATE >/dev/null 2>&1; then                                                                                                  
+                $FWUPDATE -c ${file}                                                                                                                   
+                rc=$?                                                                                                                                  
+                if [ $rc -ne 0 ]; then                                                                                                                 
+                        set_fwupdate_status ${STATUSFILE} "invalid"                                                                                    
+                        [ ${keepfile} -eq 1 ] || rm -f ${file}                                                                                         
+                        unlock_and_err ${LOCKFILE} 10 " ${file} (Firmware: ${ver}) doesn't fit the system!\n"                                          
+                fi                                                                                                                                     
+        fi                                                                                                                                             
+                                                                                                                                                       
+        echo "Firmware: ${ver}"                                                                                                                        
+                                                                                                                                                       
+                                                                                                                                                       
+        local upgrade_error=''                                                                                                                         
+        if $IS_UDM; then                                                                                                                               
+                # use UDM-specific upgrade mechanism                                                                                                   
+                set_fwupdate_status ${STATUSFILE} "updating"                                                                                           
+                # Trap SIGHUP. ubnt-upgrade kills ssh on successful upgrade and                                                                        
+                # this allows the script to keep running so we can unlock the                                                                          
+                # LOCKFILE and reboot when running from ssh.                                                                                           
+                trap '' INT QUIT HUP TERM PIPE                                                                                                         
+                ubnt-upgrade -k "${file}"                                                                                                              
+                rc=$?                                                                                                                                  
+                upgrade_error="Failed ubnt-upgrade ($rc)"                                                                                              
+        else                                                                                                                                           
+                set_fwupdate_status ${STATUSFILE} "moving"                                                                                             
+                fw_move "${file}"                                                                                                                      
+                rc=$?                                                                                                                                  
+                upgrade_error="Failed moving ${file} to /boot/fwupdate.bin"                                                                            
+        fi                                                                                                                                             
+                                                                                                                                                       
+        if [ $rc -ne 0 ]; then                                                                                                                         
+                [ ${keepfile} -eq 1 ] || rm -f ${file}                                                                                                 
+                set_fwupdate_status ${STATUSFILE} "failed"                                                                                             
+                unlock_and_err ${LOCKFILE} 8 "${upgrade_error}"                                                                                        
+        fi                                                                                                                                             
+                                                                                                                                                       
+        set_fwupdate_status ${STATUSFILE} "rebooting"                                                                                                  
+        echo "Firmware ready - rebooting to update..."                                                                                                 
+        dotlockfile -u ${LOCKFILE}                                                                                                                     
+        do_reboot 'fwupgrade'                                                                                                                          
+}                                                                                                                                                      
+                                                                                                                                                       
+do_pwcheck() {                                                                                                                                         
+        exec pwcheck $*                                                                                                                                
+}                                                                                                                                                      
+                                                                                                                                                       
+get_adminname() {                                                                                                                                      
+        adminname=$(awk -F: '/root/{if ($1 != "root") print $1}' /etc/security/usermap.conf | sed -n '1p')                                             
+        echo "${adminname}"                                                                                                                            
+}                                                                                                                                                      
+                                                                                                                                                       
+get_adminemail() {                                                                                                                                     
+        adminemail=$(awk -F: '/root/{if ($1 != "root") print $1}' /etc/security/usermap.conf | sed -n '2p')                                            
+        echo "${adminemail}"                                                                                                                           
+}                                                                                                                                                      
+                                                                                                                                                       
+do_chpasswd() {                                                                                                                                        
+        # on UDM, busybox chpasswd bypasses linux-pam, so we must clobber the username with root if it is the admin name                               
+        if $IS_UDM; then                                                                                                                               
+                head -n1 | sed "s/^$(get_adminname):/root:/" | sed "s/^$(get_adminemail):/root:/" | exec chpasswd $*                                   
+        else                                                                                                                                           
+                head -n1 | exec chpasswd $*                                                                                                            
+        fi                                                                                                                                             
+        save_user_pass_tz_hostname                                                                                                                     
+}
+
+do_cputemp() {                                                                                                                                         
+        if $IS_UDM; then                                                                                                                               
+                ubios-udapi-client get -r /statistics |                                                                                                
+                        jq '.[]?.device.temperatures[]? | select(.name == "CPU") | .value // 0'                                                        
+        else                                                                                                                                           
+                echo 0                                                                                                                                 
+        fi                                                                                                                                             
+}                                                                                                                                                      
+                                                                                                                                                       
+do_reboot() {                                                                                                                                          
+        reason="${1:-systool}"                                                                                                                         
+        reboot "${reason}" || reboot -f "${reason}"                                                                                                    
+}                                                                                                                                                      
+                                                                                                                                                       
+do_portstatus() {                                                                                                                                      
+        if $IS_UDM; then                                                                                                                               
+                ubios-udapi-client get -r /interfaces |                                                                                                
+                        jq 'map( { (.identification.id | tostring) : .status.plugged } ) | add'                                                        
+        else                                                                                                                                           
+                echo "{}"                                                                                                                              
+        fi                                                                                                                                             
+}                                                                                                                                                      
+                                                                                                                                                       
+do_poweroff() {                                                                                                                                        
+        poweroff || poweroff -f                                                                                                                        
+}                                                                                                                                                      
+                                                                                                                                                       
+leds_reset2defaults() {                                                                                                                                
+        if command -v sysled >/dev/null 2>&1; then                                                                                                     
+                sysled reset2defaults                                                                                                                  
+        else                                                                                                                                           
+                if [ -d /sys/class/leds/blue ]; then                                                                                                   
+                        local led=/sys/class/leds/blue                                                                                                 
+                        echo none > ${led}/trigger                                                                                                     
+                        echo 0 > ${led}/brightness                                                                                                     
+                fi                                                                                                                                     
+                if [ -d /sys/class/leds/white ]; then                                                                                                  
+                        local led=/sys/class/leds/white                                                                                                
+                        echo 0 > ${led}/brightness                                                                                                     
+                        echo timer > ${led}/trigger                                                                                                    
+                        cat ${led}/max_brightness > ${led}/brightness                                                                                  
+                        # ~3 flashes in 2 seconds                                                                                                      
+                        echo 50 > ${led}/delay_on                                                                                                      
+                        echo 610 > ${led}/delay_off                                                                                                    
+                fi                                                                                                                                     
+        fi                                                                                                                                             
+}
+
+do_reset2defaults() {                                                                                                                                  
+        reason="${1:-systool}"                                                                                                                         
+        if $IS_UDM; then                                                                                                                               
+                /sbin/factory-reset.sh "${reason}"                                                                                                     
+                return $?                                                                                                                              
+        fi                                                                                                                                             
+        if mountpoint -q /boot >/dev/null 2>&1; then                                                                                                   
+                mount -o remount,rw /boot                                                                                                              
+        fi                                                                                                                                             
+        touch /boot/reset2defaults                                                                                                                     
+        sync                                                                                                                                           
+        if mountpoint -q /boot >/dev/null 2>&1; then                                                                                                   
+                mount -o remount,ro /boot                                                                                                              
+        fi                                                                                                                                             
+        if [ -f /boot/reset2defaults ]; then                                                                                                           
+                leds_reset2defaults                                                                                                                    
+                do_reboot "${reason}"                                                                                                                  
+        fi                                                                                                                                             
+}                                                                                                                                                      
+                                                                                                                                                       
+session_cleanup() {                                                                                                                                    
+        PHP_SESSIONDIR=/run/php/sessions                                                                                                               
+        PHP_TMPDIR=/run/php/tmp                                                                                                                        
+                                                                                                                                                       
+        [ -e /etc/default/php ] && . /etc/default/php                                                                                                  
+                                                                                                                                                       
+        [ -d "${PHP_SESSIONDIR}" ] || return 0                                                                                                         
+                                                                                                                                                       
+        find "${PHP_SESSIONDIR}" -type f -name 'sess_*' | xargs grep -l 'authed|b:1' | xargs touch                                                     
+        ls -c -r -1 ${PHP_SESSIONDIR}/ | head -n -5 | xargs rm -f                                                                                      
+}                                                                                                                                                      
+                                                                                                                                                       
+aufs_plink_flush() {                                                                                                                                   
+        [ -x /sbin/auplink ] || return 0                                                                                                               
+        AUFS_MNTS=`mount -t aufs | awk '{print $3}'`                                                                                                   
+        if [ "${AUFS_MNTS}" != "" ]; then                                                                                                              
+                for MNT in ${AUFS_MNTS}; do                                                                                                            
+                        /sbin/auplink ${MNT} flush                                                                                                     
+                done                                                                                                                                   
+        fi                                                                                                                                             
+}                                                                                                                                                      
+                                                                                                                                                       
+do_cleanup_hourly() {                                                                                                                                  
+        session_cleanup                                                                                                                                
+}                                                                                                                                                      
+                                                                                                                                                       
+do_cleanup_daily() {                                                                                                                                   
+        aufs_plink_flush                                                                                                                               
+}                                                                                                                                                      
+                                                                                                                                                       
+do_cleanup_weekly() {                                                                                                                                  
+        return 0                                                                                                                                       
+}                                                                                                                                                      
+                                                                                                                                                       
+do_cleanup_monthly() {                                                                                                                                 
+        return 0                                                                                                                                       
+}
+
+do_cleanup_yearly() {                                                                                                                                  
+        return 0                                                                                                                                       
+}                                                                                                                                                      
+                                                                                                                                                       
+off_led() {                                                                                                                                            
+        local led=$1                                                                                                                                   
+        echo none > ${led}/trigger                                                                                                                     
+        echo 0 > ${led}/brightness                                                                                                                     
+}                                                                                                                                                      
+                                                                                                                                                       
+# args: <ledname> <action> <action-arg1> <action-arg2> <action-arg3>                                                                                   
+# ledname = `ls /sys/class/leds/`                                                                                                                      
+# action = on | off | settimer                                                                                                                         
+# when action == on                                                                                                                                    
+#   action-arg1 = brightness (optional, max_brightness is taken when it's not provided)                                                                
+# when action == settimer:                                                                                                                             
+#   action-arg1 = delay_on                                                                                                                             
+#   action-arg2 = delay_off                                                                                                                            
+#   action-arg3 = brightness (optional, max_brightness is taken when it's not provided)                                                                
+do_led() {                                                                                                                                             
+        local led=/sys/class/leds/${1}                                                                                                                 
+        if [ ! -d "${led}" ]; then                                                                                                                     
+                err 2 "LED name (${1}) not found!"                                                                                                     
+        fi                                                                                                                                             
+                                                                                                                                                       
+        local action=${2}                                                                                                                              
+        case "${action}" in                                                                                                                            
+                off)                                                                                                                                   
+                        off_led ${led}                                                                                                                 
+                        ;;                                                                                                                             
+                on)                                                                                                                                    
+                        local brightness=${3:-$(cat ${led}/max_brightness)}                                                                            
+                                                                                                                                                       
+                        echo none > ${led}/trigger                                                                                                     
+                        echo ${brightness} > ${led}/brightness                                                                                         
+                        ;;                                                                                                                             
+                settimer)                                                                                                                              
+                        if [ -z "${3}" ]; then                                                                                                         
+                                err 2 "LED delay_on is missing!"                                                                                       
+                        fi                                                                                                                             
+                        local delay_on=${3}                                                                                                            
+                                                                                                                                                       
+                        if [ -z "${4}" ]; then                                                                                                         
+                                err 2 "LED delay_off is missing!"                                                                                      
+                        fi                                                                                                                             
+                        local delay_off=${4}                                                                                                           
+                                                                                                                                                       
+                        local brightness=${5:-$(cat ${led}/max_brightness)}                                                                            
+                                                                                                                                                       
+                        off_led ${led}                                                                                                                 
+                        echo ${brightness} > ${led}/brightness                                                                                         
+                        echo timer > ${led}/trigger                                                                                                    
+                        echo ${delay_on} > ${led}/delay_on                                                                                             
+                        echo ${delay_off} > ${led}/delay_off                                                                                           
+                        ;;                                                                                                                             
+                *)                                                                                                                                     
+                        if [ ! -f "${led}/${action}" ]; then                                                                                           
+                                err 2 "LED action (${action}) not supported!"                                                                          
+                        fi                                                                                                                             
+                                                                                                                                                       
+                        if [ -z "${3}" ]; then                                                                                                         
+                                cat "${led}/${action}"                                                                                                 
+                        else                                                                                                                           
+                                echo "${3}" > "${led}/${action}"                                                                                       
+                        fi                                                                                                                             
+                        ;;                                                                                                                             
+        esac                                                                                                                                           
+}                                                                                                                                                      
+                                                                                                                                                       
+do_anonid() {                                                                                                                                          
+        local anonid=$(grep 'device.anonid' /proc/ubnthal/system.info | cut -d '=' -f 2)                                                               
+                                                                                                                                                       
+        if [ -z "$anonid" ]; then                                                                                                                      
+                err 1 "The anonid is not available."                                                                                                   
+        fi                                                                                                                                             
+                                                                                                                                                       
+        echo "$anonid"                                                                                                                                 
+}                                                                                                                                                      
+                                                                                                                                                       
+sed_pii_filter() {                                                                                                                                     
+        local STR=$1                                                                                                                                   
+        local DELIMS="][' \",|:(){}="                                                                                                                  
+        echo "s/$STR[$DELIMS]*[^$DELIMS]*[$DELIMS]*/$STR<FILTERED>/gI"                                                                                 
+}                                                                                                                                                      
+                                                                                                                                                       
+# filter some special strings related to password                                                                                                      
+# ex: pattern[[string1, password,...]]                                                                                                                 
+sed_pii_filter_spec() {                                                                                                                                
+        local STR=$1                                                                                                                                   
+        local DELIMS="][(){}"                                                                                                                          
+        echo "s/$STR[$DELIMS]*[^$DELIMS]*[$DELIMS]*/$STR<FILTERED>/gI"                                                                                 
+}                                                                                                                                                      
+                                                                                                                                                       
+sed_pii_filter_json() {                                                                                                                                
+        local STR=$1                                                                                                                                   
+        local COMMA=","                                                                                                                                
+        echo "s/\"$STR\" *: *[^$COMMA]*/\"$STR\": \"<FILTERED>\"/gI"                                                                                   
+}                                                                                                                                                      
+                                                                                                                                                       
+pii_filter() {                                                                                                                                         
+        local action="$1"                                                                                                                              
+        sed -i \                                                                                                                                       
+        -e "$($action password)" -e "$($action x_password)" -e "$($action psk)" \                                                                      
+        -e "$($action key)" -e "$($action token)" \                                                                                                    
+        -e "$($action secret)" -e "$($action passphrase)" \                                                                                            
+        -e "$($action wep)" -e "$($action wpa)" \                                                                                                      
+        -e "$($action signature)" -e "$($action community)" \                                                                                          
+        -e "$($action anonymous_device_id)" -e "$($action anonid)" \                                                                                   
+        -e "$($action anon_id)" -e "$($action anonymousDeviceId)" \                                                                                    
+        "$2"                                                                                                                                           
+}
+
+filter_pii_data() {                                                                                                                                    
+        find $1 -type f |                                                                                                                              
+                while read -r line;                                                                                                                    
+                do                                                                                                                                     
+                        [ -n "$(echo "$line" | grep "cgroup")" ] && continue                                                                           
+                        cat "$line" | python -m json.tool > /dev/null 2>&1                                                                             
+                        if [ $? -gt 0 ]; then                                                                                                          
+                                sed -i -e "$(sed_pii_filter_spec tokens)" "$line"                                                                      
+                                pii_filter sed_pii_filter "$line"                                                                                      
+                        else                                                                                                                           
+                                local temp_file=$(mktemp /tmp/tmp_file_XXXXXX)                                                                         
+                                jq . < "$line" > "$temp_file"                                                                                          
+                                mv "$temp_file" "$line"                                                                                                
+                                pii_filter sed_pii_filter_json "$line"                                                                                 
+                        fi                                                                                                                             
+                done                                                                                                                                   
+}                                                                                                                                                      
+                                                                                                                                                       
+do_filterpii () {                                                                                                                                      
+        [ -z "${1}" ] && err 1 "No filter path!"                                                                                                       
+                                                                                                                                                       
+        local FULLPATH="${1}"                                                                                                                          
+        [ ! -d $FULLPATH ] && return 1                                                                                                                 
+        filter_pii_data "$FULLPATH"                                                                                                                    
+}                                                                                                                                                      
+                                                                                                                                                       
+get_folder_usage()                                                                                                                                     
+{                                                                                                                                                      
+        for folder in "$1"/*; do                                                                                                                       
+                du -a "$folder" | awk '{if($1 > 10000) print}' | sort -n -r                                                                            
+        done                                                                                                                                           
+}                                                                                                                                                      
+                                                                                                                                                       
+do_support() {                                                                                                                                         
+        local SUBPATH="${1:-support}"                                                                                                                  
+        if $IS_UDM; then                                                                                                                               
+                local FULLPATH="${UOS_DATA}/${SUBPATH}"                                                                                                
+                mkdir -p "$FULLPATH" || return 1                                                                                                       
+                (                                                                                                                                      
+                        cd "$FULLPATH" || return 1                                                                                                     
+                        brctl show > brctl_show.txt                                                                                                    
+                        df > df.txt                                                                                                                    
+                        df -i > df-i.txt                                                                                                               
+                        dmesg > dmesg.txt                                                                                                              
+                        ebtables -L > ebtables-L.txt                                                                                                   
+                        ebtables -t nat -L > ebtables-t_nat-L.txt                                                                                      
+                        get_folder_usage "/mnt/data" > mnt-data-usage.txt                                                                              
+                        iostat -xz > iostat-xz.txt                                                                                                     
+                        ip -s addr > ip-s_addr.txt                                                                                                     
+                        ip neigh > ip_neigh.txt                                                                                                        
+                        ip route show table all > ip_route_show_table_all.txt                                                                          
+                        ip rule list > ip_rule_list.txt                                                                                                
+                        ip -s tunnel > ip-s_tunnel.txt                                                                                                 
+                        ip xfrm state > ip_xfrm_state.txt                                                                                              
+                        ip xfrm policy > ip_xfrm_policy.txt                                                                                            
+                        ipsec statusall > ipsec_statusall.txt                                                                                          
+                        ipset -L > ipset-L.txt                                                                                                         
+                        iptables-save -c > iptables-save-c.txt                                                                                         
+                        ip6tables-save -c > ip6tables-save-c.txt                                                                                       
+                        lsblk -T -o NAME,TRAN,FSTYPE,MAJ:MIN,RM,SIZE,RO,TYPE,LABEL,MOUNTPOINT > lsblk.txt                                              
+                        lsof -P -n > lsof-p-n.txt                                                                                                      
+                        mca-dump > mca-dump.txt                                                                                                        
+                        mount > mount.txt                                                                                                              
+                        mpstat -P ALL > mpstat-P_ALL.txt                                                                                               
+                        if which ss >/dev/null; then                                                                                                   
+                                ss -nlap > ss-nlap.txt                                                                                                 
+                                echo "look in ss-nlap.txt" > netstat.txt                                                                               
+                        else                                                                                                                           
+                                netstat -lna > netstat-lna.txt                                                                                         
+                        fi                                                                                                                             
+                        oopsdump > oopsdump.txt                                                                                                        
+                        podman exec -it unifi-os journalctl -a -n 10000 --no-pager > podman-journalctl-all.log                                         
+                        podman images > podman-images.txt                                                                                              
+                        podman ps > podman-ps.txt                                                                                                      
+                        ps aux > ps_aux.txt                                                                                                            
+                        qos_control.sh show -s $(cd /sys/class/net && ls) > qos_control.sh_show.txt                                                    
+                        echo "look in qos_control.sh_show.txt" > tc.txt                                                                                
+                        route -n > route-n.txt                                                                                                         
+                        route -A inet6 -n > route-A_inet6-n.txt                                                                                        
+                        [ -b "/dev/sdb" ] && smartctl --all /dev/sda > smartctl.txt                                                                    
+                        top -bn 1 > top-bn_1.txt                                                                                                       
+                        for SW in $(swconfig list | cut -d' ' -f2); do                                                                                 
+                                swconfig dev ${SW} show > swconfig_dev_${SW}_show.txt                                                                  
+                        done                                                                                                                           
+                        uptime > uptime.txt                                                                                                            
+                        cp $DATA_DIR/log/ulcmd* .                                                                                                      
+                        cp $DATA_DIR/log/mem_trend.csv .                                                                                               
+                        cp $DATA_DIR/log/messages* .                                                                                                   
+                        cp $DATA_DIR/log/trace_log* .                                                                                                  
+                        cp -fR $DATA_DIR/log/crash-report .                                                                                            
+                        cp $DATA_DIR/unifi-os/unifi/data/system.properties .                                                                           
+                                                                                                                                                       
+                        curl "$UCORE_URL"/api/info > ucore_api_info.json                                                                               
+                        curl "$UCORE_URL"/api/controllers > ucore_api_controllers.json                                                                 
+                                                                                                                                                       
+                        (                                                                                                                              
+                                local SYS_CGROUP_PATH="$FULLPATH/sys/fs"                                                                               
+                                mkdir -p "$SYS_CGROUP_PATH"                                                                                            
+                                cp -fR /sys/fs/cgroup "$SYS_CGROUP_PATH"                                                                               
+                                chmod +w -R "$SYS_CGROUP_PATH"                                                                                         
+                        )                                                                                                                              
+                        (                                                                                                                              
+                                mkdir config                                                                                                           
+                                cd config                                                                                                              
+                                cp /config/* .                                                                                                         
+                                cp /config/ubios-udapi-server/* .                                                                                      
+                        )                                                                                                                              
+                        (                                                                                                                              
+                                mkdir etc                                                                                                              
+                                cd etc                                                                                                                 
+                                cp /etc/aaa*.cfg .                                                                                                     
+                                cp /etc/board.info .                                                                                                   
+                                cp -r /etc/cron* .                                                                                                     
+                                cp /etc/inittab .                                                                                                      
+                                cp /etc/os-release .                                                                                                   
+                                cp -r /etc/sysinit* .                                                                                                  
+                                cp /etc/timezone .                                                                                                     
+                                sed -i -e "/psk/d" sysinit/element_adopt.conf                                                                          
+                        )                                                                                                                              
+                        (                                                                                                                              
+                                mkdir proc                                                                                                             
+                                cd proc                                                                                                                
+                                cp /proc/devices .                                                                                                     
+                                cp /proc/interrupts .                                                                                                  
+                                cp /proc/meminfo .                                                                                                     
+                                cp /proc/modules .                                                                                                     
+                                cp /proc/softirqs .                                                                                                    
+                                ls -dv /proc/[1-9]*/status | xargs cat > proc_pid_status.txt                                                           
+                        )                                                                                                                              
+                        (                                                                                                                              
+                                mkdir run                                                                                                              
+                                cd /run                                                                                                                
+                                find . -type f -size -500k -print0 |                                                                                   
+                                        xargs -0 -r tar -c |                                                                                           
+                                        tar -C "$FULLPATH/run" -x                                                                                      
+                                rm -f $FULLPATH/run/*psk*.* $FULLPATH/run/radiusclient/servers-l2tp                                                    
+                        )                                                                                                                              
+                        (                                                                                                                              
+                                mkdir tmp                                                                                                              
+                                cd /tmp                                                                                                                
+                                find . -type f -size -500k -print0 |                                                                                   
+                                        xargs -0 -r tar -c |                                                                                           
+                                        tar -C "$FULLPATH/tmp" -x                                                                                      
+                        )                                                                                                                              
+                        (                                                                                                                              
+                                mkdir ubnthal                                                                                                          
+                                cd ubnthal                                                                                                             
+                                cp /proc/ubnthal/board .                                                                                               
+                                cp /proc/ubnthal/system.info .                                                                                         
+                        )                                                                                                                              
+                )                                                                                                                                      
+        fi                                                                                                                                             
+}                                                                                                                                                      
+                                                                                                                                                       
+do_synctime() {                                                                                                                                        
+        /usr/sbin/ntpd -nNq -p 0.ubnt.pool.ntp.org -p 1.ubnt.pool.ntp.org                                                                              
+        rc=$?                                                                                                                                          
+                                                                                                                                                       
+        if [ $rc -eq 0 ]; then                                                                                                                         
+                echo OK                                                                                                                                
+        else                                                                                                                                           
+                echo ERR                                                                                                                               
+        fi                                                                                                                                             
+                                                                                                                                                       
+        exit $rc
+        }                                                                                                                                                      
+                                                                                                                                                       
+do_cpuload() {                                                                                                                                         
+        local load_file="/var/run/cpuload"                                                                                                             
+        if [ -f "$load_file" ]; then                                                                                                                   
+                cat $load_file                                                                                                                         
+        else                                                                                                                                           
+                last_cpu=$(cat /proc/stat)                                                                                                             
+                last_use=$(echo $last_cpu | awk -F' ' '$1 == "cpu" {print $2 + $3 + $4 + $7 + $8 + $9}')                                               
+                last_total=$(echo $last_cpu | awk -F' ' '$1 == "cpu" {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9}')                                   
+                sleep 1                                                                                                                                
+                current_cpu=$(cat /proc/stat)                                                                                                          
+                current_use=$(echo $current_cpu | awk -F' ' '$1 == "cpu" {print $2 + $3 + $4 + $7 + $8 + $9}')                                         
+                current_total=$(echo $current_cpu | awk -F' ' '$1 == "cpu" {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9}')                             
+                printf %.1f "$(( 1000 * ($current_use - $last_use) / ($current_total - $last_total) ))e-1"                                             
+        fi                                                                                                                                             
+}                                                                                                                                                      
+                                                                                                                                                       
+[ $# -lt 1 ] && usage                                                                                                                                  
+                                                                                                                                                       
+CMD=$1                                                                                                                                                 
+shift                                                                                                                                                  
+do_cmd=usage                                                                                                                                           
+                                                                                                                                                       
+case ${CMD} in                                                                                                                                         
+        adminemail|adminname|hostname|led|network|timezone)                                                                                            
+                [ $# -eq 1 ] && do_cmd="change_${CMD}"                                                                                                 
+        ;;                                                                                                                                             
+        anonid|chpasswd|cpuload|cputemp|filterpii|fwupdate|fwupdatestatus|portstatus|poweroff| \                                                       
+        pwcheck|resetbutton|reboot|reset2defaults|ssh|sshd|synctime|support)                                                                           
+                do_cmd="do_${CMD}"                                                                                                                     
+        ;;                                                                                                                                             
+        cleanup)                                                                                                                                       
+                if [ $# -eq 1 ] ; then                                                                                                                 
+                        case $1 in                                                                                                                     
+                                hourly|daily|weekly|monthly|yearly)                                                                                    
+                                do_cmd="do_cleanup_$1"                                                                                                 
+                                shift                                                                                                                  
+                                ;;                                                                                                                     
+                        esac                                                                                                                           
+                else                                                                                                                                   
+                        do_cmd="do_cleanup_hourly"                                                                                                     
+                fi                                                                                                                                     
+        ;;                                                                                                                                             
+esac                                                                                                                                                   
+eval ${do_cmd} "$@"
